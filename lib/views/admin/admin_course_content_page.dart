@@ -1,0 +1,1296 @@
+// ignore_for_file: use_build_context_synchronously
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_ui/models/user_role.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+class AdminCourseContentPage extends StatefulWidget {
+  final String courseCode;
+  final String courseName;
+  final UserRole role;
+
+  const AdminCourseContentPage({
+    super.key,
+    required this.courseCode,
+    required this.courseName,
+    required this.role,
+  });
+
+  @override
+  State<AdminCourseContentPage> createState() => _AdminCourseContentPageState();
+}
+
+class _AdminCourseContentPageState extends State<AdminCourseContentPage>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  late final DocumentReference<Map<String, dynamic>> _courseRef;
+
+  bool get isSuper => widget.role == UserRole.superAdmin;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+
+    _tabController.addListener(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+
+    _courseRef = FirebaseFirestore.instance
+        .collection('courses')
+        .doc(widget.courseCode);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _addMaterial() async {
+    final titleCtrl = TextEditingController();
+    final metaCtrl = TextEditingController();
+
+    final formKey = GlobalKey<FormState>();
+
+    PlatformFile? pickedFile;
+    bool uploading = false;
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            return AlertDialog(
+              title: const Text('Add PDF material'),
+              content: Form(
+                key: formKey,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextFormField(
+                        controller: titleCtrl,
+                        decoration: const InputDecoration(labelText: 'Title'),
+                        validator: (v) =>
+                            v == null || v.trim().isEmpty ? 'Required' : null,
+                      ),
+                      TextFormField(
+                        controller: metaCtrl,
+                        decoration: const InputDecoration(
+                          labelText: 'Meta (optional)',
+                          hintText: 'e.g. "Week 3" or "Chapter 2"',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+
+                      OutlinedButton.icon(
+                        onPressed: uploading
+                            ? null
+                            : () async {
+                                final res = await FilePicker.platform.pickFiles(
+                                  type: FileType.custom,
+                                  allowedExtensions: ['pdf'],
+                                  withData: true,
+                                );
+                                if (res == null || res.files.isEmpty) return;
+
+                                setLocalState(() {
+                                  pickedFile = res.files.single;
+                                });
+                              },
+                        icon: const Icon(Icons.upload_file),
+                        label: Text(
+                          pickedFile == null
+                              ? 'Choose PDF'
+                              : 'Selected: ${pickedFile!.name}',
+                        ),
+                      ),
+
+                      if (uploading) ...[
+                        const SizedBox(height: 12),
+                        const LinearProgressIndicator(),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Uploading...',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: uploading
+                      ? null
+                      : () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: uploading
+                      ? null
+                      : () async {
+                          if (!formKey.currentState!.validate()) return;
+
+                          if (pickedFile == null || pickedFile!.path == null) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Please choose a PDF'),
+                              ),
+                            );
+                            return;
+                          }
+
+                          setLocalState(() => uploading = true);
+
+                          try {
+                            final docRef = _courseRef
+                                .collection('materials')
+                                .doc();
+
+                            final file = pickedFile!;
+                            final bytes = file.bytes;
+                            if (bytes == null) {
+                              throw Exception(
+                                'File bytes are null. Make sure withData:true is set.',
+                              );
+                            }
+
+                            final storageRef = FirebaseStorage.instance
+                                .ref()
+                                .child('course_materials')
+                                .child(widget.courseCode)
+                                .child('${docRef.id}_${file.name}');
+
+                            final snap = await storageRef.putData(
+                              bytes,
+                              SettableMetadata(contentType: 'application/pdf'),
+                            );
+
+                            final downloadUrl = await snap.ref.getDownloadURL();
+
+                            await docRef.set({
+                              'title': titleCtrl.text.trim(),
+                              'type': 'PDF',
+                              'meta': metaCtrl.text.trim(),
+                              'url': downloadUrl,
+                              'fileName': file.name,
+                              'storagePath': snap.ref.fullPath,
+                              'createdAt': FieldValue.serverTimestamp(),
+                            });
+
+                            if (context.mounted) Navigator.pop(context, true);
+                          } catch (e) {
+                            setLocalState(() => uploading = false);
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text('Upload failed: $e')),
+                              );
+                            }
+                          }
+                        },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == true && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Material uploaded')));
+    }
+  }
+
+  Future<void> _addAnnouncement() async {
+    final titleCtrl = TextEditingController();
+    final bodyCtrl = TextEditingController();
+    bool pinned = false;
+
+    final formKey = GlobalKey<FormState>();
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setLocalState) {
+            return AlertDialog(
+              title: const Text('Add announcement'),
+              content: Form(
+                key: formKey,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextFormField(
+                        controller: titleCtrl,
+                        decoration: const InputDecoration(labelText: 'Title'),
+                        validator: (v) =>
+                            v == null || v.trim().isEmpty ? 'Required' : null,
+                      ),
+                      TextFormField(
+                        controller: bodyCtrl,
+                        decoration: const InputDecoration(labelText: 'Body'),
+                        maxLines: 4,
+                        validator: (v) =>
+                            v == null || v.trim().isEmpty ? 'Required' : null,
+                      ),
+                      const SizedBox(height: 8),
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Pinned'),
+                        value: pinned,
+                        onChanged: (val) {
+                          setLocalState(() {
+                            pinned = val ?? false;
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    if (!formKey.currentState!.validate()) return;
+                    final data = {
+                      'title': titleCtrl.text.trim(),
+                      'body': bodyCtrl.text.trim(),
+                      'pinned': pinned,
+                      'createdAt': FieldValue.serverTimestamp(),
+                    };
+                    await _courseRef.collection('announcements').add(data);
+                    if (context.mounted) {
+                      Navigator.pop(context, true);
+                    }
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == true && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Announcement added')));
+    }
+  }
+
+  Future<void> _deleteDoc(
+    CollectionReference<Map<String, dynamic>> col,
+    String id,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Delete item?'),
+          content: const Text('This action cannot be undone. Are you sure?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed == true) {
+      await col.doc(id).delete();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Deleted')));
+      }
+    }
+  }
+
+  Widget? _buildFab() {
+    if (isSuper) return null;
+
+    if (_tabController.index == 0) {
+      return FloatingActionButton(
+        onPressed: _addMaterial,
+        child: const Icon(Icons.add),
+      );
+    }
+    if (_tabController.index == 1) {
+      return FloatingActionButton(
+        onPressed: _addAnnouncement,
+        child: const Icon(Icons.add),
+      );
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final courseTitle = '${widget.courseCode} – ${widget.courseName}';
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(courseTitle),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'Materials'),
+            Tab(text: 'Announcements'),
+            Tab(text: 'Students'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _MaterialsTab(
+            courseRef: _courseRef,
+            canEdit: !isSuper,
+            onDelete: (id) =>
+                _deleteDoc(_courseRef.collection('materials'), id),
+          ),
+          _AnnouncementsTab(
+            courseRef: _courseRef,
+            canEdit: !isSuper,
+            onDelete: (id) =>
+                _deleteDoc(_courseRef.collection('announcements'), id),
+          ),
+          _StudentsTab(
+            courseCode: widget.courseCode,
+            courseName: widget.courseName,
+            role: widget.role,
+          ),
+        ],
+      ),
+      floatingActionButton: _buildFab(),
+    );
+  }
+}
+
+class _MaterialsTab extends StatelessWidget {
+  final DocumentReference<Map<String, dynamic>> courseRef;
+  final Future<void> Function(String id) onDelete;
+  final bool canEdit;
+
+  const _MaterialsTab({
+    required this.courseRef,
+    required this.canEdit,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: courseRef.collection('materials').orderBy('title').snapshots(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final docs = snap.data?.docs ?? [];
+
+        if (docs.isEmpty) {
+          return const Center(child: Text('No materials yet.\nTap + to add.'));
+        }
+
+        return ListView.separated(
+          padding: const EdgeInsets.all(12),
+          itemCount: docs.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 8),
+          itemBuilder: (context, index) {
+            final doc = docs[index];
+            final data = doc.data();
+            final title = (data['title'] ?? 'Untitled') as String;
+            final type = (data['type'] ?? '') as String;
+            final meta = (data['meta'] ?? '') as String;
+            final url = (data['url'] ?? '') as String;
+
+            return Material(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              elevation: 1,
+              child: ListTile(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                leading: CircleAvatar(
+                  child: Text(type.isEmpty ? 'F' : type[0].toUpperCase()),
+                ),
+                title: Text(title, style: const TextStyle(fontSize: 14)),
+                subtitle: meta.isEmpty
+                    ? null
+                    : Text(meta, style: const TextStyle(fontSize: 12)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (url.isNotEmpty)
+                      IconButton(
+                        icon: const Icon(Icons.open_in_new),
+                        onPressed: () async {
+                          final uri = Uri.tryParse(url);
+                          if (uri != null) {
+                            await launchUrl(
+                              uri,
+                              mode: LaunchMode.externalApplication,
+                            );
+                          }
+                        },
+                      ),
+                    if (canEdit)
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        onPressed: () => onDelete(doc.id),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _AnnouncementsTab extends StatelessWidget {
+  final DocumentReference<Map<String, dynamic>> courseRef;
+  final Future<void> Function(String id) onDelete;
+  final bool canEdit;
+
+  const _AnnouncementsTab({
+    required this.courseRef,
+    required this.canEdit,
+    required this.onDelete,
+  });
+
+  String _fmtDate(Timestamp? ts) {
+    if (ts == null) return '';
+    final d = ts.toDate();
+    return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: courseRef
+          .collection('announcements')
+          .orderBy('createdAt', descending: true)
+          .snapshots(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final docs = snap.data?.docs ?? [];
+
+        if (docs.isEmpty) {
+          return const Center(
+            child: Text('No announcements yet.\nTap + to add.'),
+          );
+        }
+
+        return ListView.separated(
+          padding: const EdgeInsets.all(12),
+          itemCount: docs.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 8),
+          itemBuilder: (context, index) {
+            final doc = docs[index];
+            final data = doc.data();
+            final title = (data['title'] ?? 'Untitled') as String;
+            final body = (data['body'] ?? '') as String;
+            final pinned = (data['pinned'] ?? false) as bool;
+            final createdAt = data['createdAt'] as Timestamp?;
+
+            return Material(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              elevation: 1,
+              child: ListTile(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                title: Row(
+                  children: [
+                    if (pinned)
+                      const Icon(Icons.push_pin, size: 16, color: Colors.red),
+                    if (pinned) const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (body.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4.0),
+                        child: Text(body, style: const TextStyle(fontSize: 13)),
+                      ),
+                    if (createdAt != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4.0),
+                        child: Text(
+                          _fmtDate(createdAt),
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                trailing: canEdit
+                    ? IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        onPressed: () => onDelete(doc.id),
+                      )
+                    : null,
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _StudentsTab extends StatelessWidget {
+  final String courseCode;
+  final String courseName;
+  final UserRole role;
+
+  const _StudentsTab({
+    required this.courseCode,
+    required this.courseName,
+    required this.role,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final db = FirebaseFirestore.instance;
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: db
+          .collection('users')
+          .where('enrolledCourses', arrayContains: courseCode)
+          .snapshots(),
+      builder: (context, snap) {
+        if (snap.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snap.hasError) {
+          return Center(
+            child: Text(
+              'Error loading students:\n${snap.error}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.red, fontSize: 13),
+            ),
+          );
+        }
+
+        final docs = snap.data?.docs ?? [];
+
+        if (docs.isEmpty) {
+          return const Center(
+            child: Text(
+              'No students are currently enrolled in this course.',
+              textAlign: TextAlign.center,
+            ),
+          );
+        }
+
+        return ListView.separated(
+          padding: const EdgeInsets.all(12),
+          itemCount: docs.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 8),
+          itemBuilder: (context, index) {
+            final d = docs[index];
+            final data = d.data();
+            final name = (data['name'] ?? 'Unnamed student') as String;
+            final uniId = data['id']?.toString() ?? '';
+            final email = data['email']?.toString() ?? '';
+
+            return Material(
+              color: Colors.white,
+              elevation: 1,
+              borderRadius: BorderRadius.circular(12),
+              child: ListTile(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                title: Text(
+                  name,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                subtitle: Text(
+                  [
+                    if (uniId.isNotEmpty) 'ID: $uniId',
+                    if (email.isNotEmpty) email,
+                  ].join(' • '),
+                  style: const TextStyle(fontSize: 12),
+                ),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => AdminStudentCoursePage(
+                        role: role,
+                        userId: d.id,
+                        studentName: name,
+                        studentNumber: uniId,
+                        courseCode: courseCode,
+                        courseName: courseName,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class AdminStudentCoursePage extends StatelessWidget {
+  final UserRole role;
+  final String userId;
+  final String studentName;
+  final String studentNumber;
+  final String courseCode;
+  final String courseName;
+
+  const AdminStudentCoursePage({
+    super.key,
+    required this.role,
+    required this.userId,
+    required this.studentName,
+    required this.studentNumber,
+    required this.courseCode,
+    required this.courseName,
+  });
+
+  bool get isSuper => role == UserRole.superAdmin;
+
+  @override
+  Widget build(BuildContext context) {
+    final db = FirebaseFirestore.instance;
+    final userCourseRef = db
+        .collection('users')
+        .doc(userId)
+        .collection('courses')
+        .doc(courseCode);
+
+    final gradesCol = userCourseRef.collection('grades');
+    final absencesCol = userCourseRef.collection('absences');
+
+    return Scaffold(
+      appBar: AppBar(title: Text('$studentName – $courseCode')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '$courseCode – $courseName',
+              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+            ),
+            if (studentNumber.isNotEmpty)
+              Text(
+                'Student ID: $studentNumber',
+                style: const TextStyle(fontSize: 13, color: Colors.black54),
+              ),
+            const SizedBox(height: 16),
+
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Grades',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+                if (!isSuper)
+                  TextButton.icon(
+                    onPressed: () => _showAddGradeDialog(context, gradesCol),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Add'),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: gradesCol.orderBy('order').snapshots(),
+              builder: (context, snap) {
+                if (snap.connectionState == ConnectionState.waiting) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: CircularProgressIndicator(),
+                    ),
+                  );
+                }
+
+                final docs = snap.data?.docs ?? [];
+
+                if (docs.isEmpty) {
+                  return const Text(
+                    'No grades yet for this student in this course.',
+                    style: TextStyle(fontSize: 13, color: Colors.black54),
+                  );
+                }
+
+                double total = 0;
+                double totalMax = 0;
+                for (final d in docs) {
+                  final data = d.data();
+                  final s = (data['score'] ?? 0) as num;
+                  final m = (data['maxScore'] ?? 0) as num;
+                  total += s.toDouble();
+                  totalMax += m.toDouble();
+                }
+
+                return Column(
+                  children: [
+                    ListView.separated(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: docs.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final d = docs[index];
+                        final data = d.data();
+
+                        final label = (data['label'] ?? 'Unnamed') as String;
+                        final score = (data['score'] ?? 0) as num;
+                        final maxScore = (data['maxScore'] ?? 0) as num;
+                        final order = data['order'];
+
+                        final bool confirmed =
+                            (data['confirmed'] ?? false) == true;
+                        final bool submitted =
+                            (data['submittedForApproval'] ?? false) == true;
+
+                        Widget statusChip;
+                        if (confirmed) {
+                          statusChip = const Chip(
+                            label: Text('Confirmed'),
+                            visualDensity: VisualDensity.compact,
+                            labelStyle: TextStyle(fontSize: 11),
+                          );
+                        } else if (submitted) {
+                          statusChip = const Chip(
+                            label: Text('Pending'),
+                            visualDensity: VisualDensity.compact,
+                            labelStyle: TextStyle(fontSize: 11),
+                          );
+                        } else {
+                          statusChip = const Chip(
+                            label: Text('Draft'),
+                            visualDensity: VisualDensity.compact,
+                            labelStyle: TextStyle(fontSize: 11),
+                          );
+                        }
+
+                        return ListTile(
+                          dense: true,
+                          title: Text(
+                            label,
+                            style: const TextStyle(fontSize: 14),
+                          ),
+                          subtitle: order == null
+                              ? null
+                              : Text(
+                                  'Order: $order',
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.black54,
+                                  ),
+                                ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              statusChip,
+                              const SizedBox(width: 6),
+                              Text(
+                                '${score.toString()} / ${maxScore.toString()}',
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                              if (!isSuper) ...[
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.edit_outlined,
+                                    size: 18,
+                                  ),
+                                  onPressed: confirmed
+                                      ? null
+                                      : () => _showEditGradeDialog(
+                                          context,
+                                          gradesCol,
+                                          d.id,
+                                          data,
+                                        ),
+                                ),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    size: 18,
+                                  ),
+                                  onPressed: confirmed
+                                      ? null
+                                      : () async {
+                                          await gradesCol.doc(d.id).delete();
+                                        },
+                                ),
+                                if (!confirmed && !submitted)
+                                  TextButton(
+                                    onPressed: () => _requestGradeConfirmation(
+                                      context,
+                                      gradesCol,
+                                      d.id,
+                                    ),
+                                    child: const Text('Request'),
+                                  ),
+                              ] else ...[
+                                if (!confirmed && submitted)
+                                  TextButton(
+                                    onPressed: () => _confirmGrade(
+                                      context,
+                                      gradesCol,
+                                      d.id,
+                                      label,
+                                    ),
+                                    child: const Text('Confirm'),
+                                  ),
+                              ],
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 4),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: Text(
+                        'Total: $total / $totalMax',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+
+            const SizedBox(height: 24),
+
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Absences',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+                if (!isSuper)
+                  TextButton.icon(
+                    onPressed: () =>
+                        _showAddAbsenceDialog(context, absencesCol),
+                    icon: const Icon(Icons.add),
+                    label: const Text('Add'),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: absencesCol.orderBy('date', descending: true).snapshots(),
+              builder: (context, snap) {
+                if (snap.connectionState == ConnectionState.waiting) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: CircularProgressIndicator(),
+                    ),
+                  );
+                }
+
+                final docs = snap.data?.docs ?? [];
+
+                if (docs.isEmpty) {
+                  return const Text(
+                    'No recorded absences for this course.',
+                    style: TextStyle(fontSize: 13, color: Colors.black54),
+                  );
+                }
+
+                return ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: docs.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final d = docs[index];
+                    final data = d.data();
+                    final ts = data['date'] as Timestamp?;
+                    final note = data['note']?.toString() ?? '';
+
+                    String dateStr = '';
+                    if (ts != null) {
+                      final dd = ts.toDate();
+                      dateStr =
+                          '${dd.year}-${dd.month.toString().padLeft(2, '0')}-${dd.day.toString().padLeft(2, '0')} '
+                          '${dd.hour.toString().padLeft(2, '0')}:${dd.minute.toString().padLeft(2, '0')}';
+                    }
+
+                    return ListTile(
+                      dense: true,
+                      title: Text(dateStr.isEmpty ? 'No date' : dateStr),
+                      subtitle: note.isEmpty
+                          ? null
+                          : Text(note, style: const TextStyle(fontSize: 12)),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 18),
+                        onPressed: () async {
+                          await absencesCol.doc(d.id).delete();
+                        },
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static Future<void> _showAddGradeDialog(
+    BuildContext context,
+    CollectionReference<Map<String, dynamic>> gradesCol,
+  ) async {
+    final labelCtrl = TextEditingController();
+    final scoreCtrl = TextEditingController();
+    final maxCtrl = TextEditingController();
+    final orderCtrl = TextEditingController();
+
+    final formKey = GlobalKey<FormState>();
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Add grade'),
+          content: Form(
+            key: formKey,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextFormField(
+                    controller: labelCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Label (e.g. Quiz 1)',
+                    ),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: scoreCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Score (e.g. 8)',
+                    ),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: maxCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Max score (e.g. 10)',
+                    ),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: orderCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Order (optional, e.g. 1)',
+                    ),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: false,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                if (!formKey.currentState!.validate()) return;
+
+                final label = labelCtrl.text.trim();
+                final score = double.tryParse(scoreCtrl.text.trim()) ?? 0;
+                final maxScore = double.tryParse(maxCtrl.text.trim()) ?? 0;
+                final order = int.tryParse(orderCtrl.text.trim());
+
+                await gradesCol.add({
+                  'label': label,
+                  'score': score,
+                  'maxScore': maxScore,
+                  if (order != null) 'order': order,
+                  'confirmed': false,
+                  'submittedForApproval': false,
+                  'createdAt': FieldValue.serverTimestamp(),
+                });
+
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  static Future<void> _showEditGradeDialog(
+    BuildContext context,
+    CollectionReference<Map<String, dynamic>> gradesCol,
+    String docId,
+    Map<String, dynamic> data,
+  ) async {
+    final labelCtrl = TextEditingController(text: data['label']?.toString());
+    final scoreCtrl = TextEditingController(text: data['score']?.toString());
+    final maxCtrl = TextEditingController(text: data['maxScore']?.toString());
+    final orderCtrl = TextEditingController(
+      text: data['order']?.toString() ?? '',
+    );
+
+    final formKey = GlobalKey<FormState>();
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Edit grade'),
+          content: Form(
+            key: formKey,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextFormField(
+                    controller: labelCtrl,
+                    decoration: const InputDecoration(labelText: 'Label'),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: scoreCtrl,
+                    decoration: const InputDecoration(labelText: 'Score'),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: maxCtrl,
+                    decoration: const InputDecoration(labelText: 'Max score'),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    validator: (v) =>
+                        v == null || v.trim().isEmpty ? 'Required' : null,
+                  ),
+                  TextFormField(
+                    controller: orderCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Order (optional)',
+                    ),
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: false,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                if (!formKey.currentState!.validate()) return;
+
+                final label = labelCtrl.text.trim();
+                final score = double.tryParse(scoreCtrl.text.trim()) ?? 0;
+                final maxScore = double.tryParse(maxCtrl.text.trim()) ?? 0;
+                final order = int.tryParse(orderCtrl.text.trim());
+
+                final updateData = <String, dynamic>{
+                  'label': label,
+                  'score': score,
+                  'maxScore': maxScore,
+                  'confirmed': false,
+                };
+                if (order != null) {
+                  updateData['order'] = order;
+                } else {
+                  updateData.remove('order');
+                }
+
+                await gradesCol.doc(docId).update(updateData);
+
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Update'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  static Future<void> _requestGradeConfirmation(
+    BuildContext context,
+    CollectionReference<Map<String, dynamic>> gradesCol,
+    String docId,
+  ) async {
+    try {
+      await gradesCol.doc(docId).update({
+        'submittedForApproval': true,
+        'requestedAt': FieldValue.serverTimestamp(),
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Confirmation requested')));
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to request confirmation: $e')),
+      );
+    }
+  }
+
+  static Future<void> _confirmGrade(
+    BuildContext context,
+    CollectionReference<Map<String, dynamic>> gradesCol,
+    String docId,
+    String label,
+  ) async {
+    try {
+      final auth = FirebaseAuth.instance;
+      await gradesCol.doc(docId).update({
+        'confirmed': true,
+        'submittedForApproval': false,
+        'confirmedBy': auth.currentUser?.uid,
+        'confirmedAt': FieldValue.serverTimestamp(),
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Confirmed $label')));
+    } catch (e) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to confirm grade: $e')));
+    }
+  }
+
+  static Future<void> _showAddAbsenceDialog(
+    BuildContext context,
+    CollectionReference<Map<String, dynamic>> absencesCol,
+  ) async {
+    final noteCtrl = TextEditingController();
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogCtx) {
+        return AlertDialog(
+          title: const Text('Add absence'),
+          content: TextField(
+            controller: noteCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Note (optional)',
+              hintText: 'e.g. Sick leave, missed quiz',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                try {
+                  await absencesCol.add({
+                    // used by the stream: orderBy('date', descending: true)
+                    'date': FieldValue.serverTimestamp(),
+                    'note': noteCtrl.text.trim(),
+                  });
+
+                  // close dialog after successful save
+                  Navigator.pop(dialogCtx);
+                } catch (e) {
+                  // show error if something goes wrong (rules, network, etc.)
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Failed to add absence: $e')),
+                  );
+                }
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
