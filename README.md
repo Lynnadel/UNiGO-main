@@ -349,6 +349,6 @@ Key results:
 
 <div align="center">
 
-Built with ❤️ at the University of Jordan · 2025
+Built with ❤️ at the University of Jordan 
 
 </div>
